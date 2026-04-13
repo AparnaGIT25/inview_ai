@@ -1,12 +1,15 @@
-import { generateText } from "ai";
+import { generateObject } from "ai";
 import { google } from "@ai-sdk/google";
 import { db } from "@/firebase/admin";
 import { getRandomInterviewCover } from "@/lib/utils";
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/actions/auth.action";
-import pdf from "pdf-parse"; 
+import pdf from "pdf-parse";
+import { z } from "zod";
 
-export const runtime = "nodejs"; 
+export const runtime = "nodejs";
+
+// Force specific configuration for body parsing if needed
 export const config = {
   api: {
     bodyParser: false,
@@ -18,135 +21,91 @@ export async function POST(req: NextRequest) {
     const formData = await req.formData();
     const file = formData.get("resume") as File;
 
-    if (!file)
+    if (!file) {
       return NextResponse.json(
         { success: false, error: "No file uploaded" },
         { status: 400 }
       );
+    }
 
     const user = await getCurrentUser();
-    if (!user)
+    if (!user) {
       return NextResponse.json(
-        { success: false, error: "Unauthorized" },
+        { success: false, error: "Unauthorized. Please sign in." },
         { status: 401 }
       );
+    }
+
+    // --- STEP 1: PDF Text Extraction ---
     const buffer = Buffer.from(await file.arrayBuffer());
     const pdfData = await pdf(buffer);
     const resumeText = pdfData.text;
 
     if (!resumeText || resumeText.trim().length < 30) {
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Failed to extract readable text from resume. Make sure it's a real text-based PDF, not an image scan.",
+        { 
+          success: false, 
+          error: "Could not extract text. Please upload a text-based PDF." 
         },
         { status: 400 }
       );
     }
 
-    const { text: extractedDetails } = await generateText({
-      model: google("gemini-2.5-flash"),
-      prompt: `
-You are a resume information extractor.
-
-Given the following resume text, extract structured data:
-- Full Name
-- Contact Information (Phone, Email)
-- Skills (list all)
-- Work Experience (company, title, duration)
-- Projects (titles, technologies, brief descriptions)
-- Education (degree, institute, year)
-- Certifications & Achievements
-- Years of experience
-
-Also include:
-- Level: "Fresher" | "Junior" | "Mid-level" | "Senior" | "Lead"
-- Tech Stack: a deduplicated array of technologies mentioned anywhere.
-
-Return a **valid JSON object only**.
-
---- RESUME TEXT START ---
-${resumeText}
---- RESUME TEXT END ---
-`,
+    // --- STEP 2: Extract Resume Details ---
+    // We wrap everything in a z.object to prevent the 'items' proto error
+    const { object: parsedDetails } = await generateObject({
+      model: google("models/gemini-1.5-flash-latest"),
+      schema: z.object({
+        fullName: z.string().describe("The candidate's full name"),
+        skills: z.array(z.string()).describe("List of technical skills"),
+        level: z.enum(["Fresher", "Junior", "Mid-level", "Senior", "Lead"]),
+        techStack: z.array(z.string()).describe("Unique technologies mentioned"),
+      }),
+      prompt: `Extract structured data from the following resume text:\n\n${resumeText}`,
     });
 
-    let parsedDetails;
-    try {
-      const cleanJson = extractedDetails
-        .replace(/```(?:json)?/gi, "")
-        .replace(/```/g, "")
-        .trim();
-      parsedDetails = JSON.parse(cleanJson);
-    } catch (error) {
-      console.error("Gemini parse error:", extractedDetails);
-      return NextResponse.json(
-        { success: false, error: "Invalid JSON format from Gemini" },
-        { status: 500 }
-      );
-    }
-    const { text: questions } = await generateText({
-      model: google("gemini-2.5-flash"),
-      prompt: `
-Generate 5 technical interview questions based on this candidate's resume:
-
-Skills: ${JSON.stringify(parsedDetails.Skills || [])}
-Projects: ${JSON.stringify(parsedDetails.Projects || [])}
-Work Experience: ${JSON.stringify(parsedDetails["Work Experience"] || [])}
-Education: ${JSON.stringify(parsedDetails.Education || [])}
-Certifications: ${JSON.stringify(parsedDetails["Certifications & Achievements"] || [])}
-Level: ${parsedDetails.Level || "Unknown"}
-
-Rules:
-- All questions must be technical and relevant.
-- If Fresher, ask beginner-to-intermediate questions.
-- Return ONLY a JSON array of strings, e.g. ["Question 1", "Question 2", ...]
-- No markdown, no code blocks, no explanations.
-`,
+    // --- STEP 3: Generate Interview Questions ---
+    // Fix: We wrap the array in an object called 'questions'
+    const { object: questionData } = await generateObject({
+      model: google("gemini-1.5-flash"),
+      schema: z.object({
+        questions: z.array(z.string()).length(5).describe("5 technical questions"),
+      }),
+      prompt: `Generate 5 technical interview questions for a ${parsedDetails.level} role. 
+               Focus on these skills: ${parsedDetails.skills.join(", ")}. 
+               The questions should be challenging but relevant to their experience.`,
     });
 
-    let parsedQuestions;
-    try {
-      const cleanJson = questions
-        .replace(/```(?:json)?/gi, "")
-        .replace(/```/g, "")
-        .trim();
-      parsedQuestions = JSON.parse(cleanJson);
-      if (!Array.isArray(parsedQuestions))
-        throw new Error("Expected array of strings");
-    } catch (error) {
-      console.error("Gemini question parse error:", questions);
-      return NextResponse.json(
-        { success: false, error: "Invalid question JSON format" },
-        { status: 500 }
-      );
-    }
-
-    const interview = {
-      role: parsedDetails["Full Name"] || "Candidate",
+    // --- STEP 4: Save to Firestore ---
+    const interviewData = {
+      role: parsedDetails.fullName || "Candidate",
       type: "resume-based",
-      level: parsedDetails.Level || "Unknown",
-      techstack: parsedDetails["Tech Stack"] || [],
-      questions: parsedQuestions,
+      level: parsedDetails.level,
+      techstack: parsedDetails.techStack,
+      questions: questionData.questions, // This is now the array of strings
       userId: user.id,
       finalized: true,
       coverImage: getRandomInterviewCover(),
       createdAt: new Date().toISOString(),
     };
 
-    await db.collection("interviews").add(interview);
+    const docRef = await db.collection("interviews").add(interviewData);
 
-    return NextResponse.json({ success: true, interview }, { status: 200 });
-  } catch (error) {
-    console.error("Unexpected Error:", error);
     return NextResponse.json(
-      {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "An unknown error occurred",
+      { 
+        success: true, 
+        interview: { ...interviewData, id: docRef.id } 
+      },
+      { status: 200 }
+    );
+
+  } catch (error: any) {
+    console.error("InView AI Resume API Error:", error);
+    
+    return NextResponse.json(
+      { 
+        success: false, 
+        error: error.message || "An unexpected error occurred during processing." 
       },
       { status: 500 }
     );
@@ -155,7 +114,7 @@ Rules:
 
 export async function GET() {
   return NextResponse.json(
-    { success: true, data: "Resume API is working!" },
+    { success: true, message: "InView.AI Resume API is active." },
     { status: 200 }
   );
 }
