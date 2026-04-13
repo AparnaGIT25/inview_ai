@@ -41,7 +41,7 @@ async function Home() {
   </Link>
 </Button>
               <p className="pt-2">OR</p>
-              <UploadResumeDialog />
+              <UploadResumeDialog userId={user?.id || ""} />
             </div>
           </div>
 
