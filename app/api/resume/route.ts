@@ -54,7 +54,7 @@ export async function POST(req: NextRequest) {
     // --- STEP 2: Extract Resume Details ---
     // We wrap everything in a z.object to prevent the 'items' proto error
     const { object: parsedDetails } = await generateObject({
-      model: google("models/gemini-1.5-flash-latest"),
+      model: google("gemini-2.5-flash"),
       schema: z.object({
         fullName: z.string().describe("The candidate's full name"),
         skills: z.array(z.string()).describe("List of technical skills"),
@@ -67,7 +67,7 @@ export async function POST(req: NextRequest) {
     // --- STEP 3: Generate Interview Questions ---
     // Fix: We wrap the array in an object called 'questions'
     const { object: questionData } = await generateObject({
-      model: google("gemini-1.5-flash"),
+      model: google("gemini-2.5-flash"),
       schema: z.object({
         questions: z.array(z.string()).length(5).describe("5 technical questions"),
       }),
